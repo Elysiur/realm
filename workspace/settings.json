@@ -1,0 +1,20 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "/home/ubuntu/realm/workspace/datasets",
+  "weights_dir": "/home/ubuntu/realm/workspace/weights",
+  "runs_dir": "/home/ubuntu/realm/workspace/runs",
+  "uuid": "891b610bfdd6c83b218b960532aeb2a19725bc6e993800952759094107356bf0",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true
+}

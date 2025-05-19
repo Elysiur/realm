@@ -805,6 +805,14 @@ def is_git_dir():
     """
     return GIT_DIR is not None
 
+def is_workspace_dir():
+    """
+    Determines whether the current file is a workspace folder.
+
+    Returns:
+        (bool): True if current file is a workspace folder.
+    """
+    return WORKSPACE_DIR is not None
 
 def get_git_origin_url():
     """
@@ -909,8 +917,9 @@ IS_JUPYTER = is_jupyter()
 IS_PIP_PACKAGE = is_pip_package()
 IS_RASPBERRYPI = is_raspberrypi()
 GIT_DIR = get_git_dir()
+WORKSPACE_DIR = GIT_DIR / 'workspace'
 IS_GIT_DIR = is_git_dir()
-USER_CONFIG_DIR = Path(os.getenv("YOLO_CONFIG_DIR") or get_user_config_dir())  # Ultralytics settings dir
+USER_CONFIG_DIR = Path(os.getenv("YOLO_CONFIG_DIR") or WORKSPACE_DIR)  # Ultralytics settings dir
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.json"
 
 
@@ -1288,9 +1297,9 @@ class SettingsManager(JSONDict):
         import uuid
 
         from ultralytics.utils.torch_utils import torch_distributed_zero_first
-
-        root = GIT_DIR or Path()
-        datasets_root = (root.parent if GIT_DIR and is_dir_writeable(root.parent) else root).resolve()
+        
+        root = WORKSPACE_DIR or Path()
+        datasets_root = (root if WORKSPACE_DIR and is_dir_writeable(root) else root.parent).resolve()
 
         self.file = Path(file)
         self.version = version
