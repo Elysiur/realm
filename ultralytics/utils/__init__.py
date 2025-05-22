@@ -35,11 +35,11 @@ LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO
-WORKSPACE = FILE.parent[1] # workspace
+WORKSPACE = ROOT.parents[0] / "workspace" # workspace
 ASSETS = WORKSPACE / "assets"  # default images
 ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v0.0.0"  # assets GitHub URL
-DEFAULT_CFG_PATH = WORKSPACE / "cfg/default.yaml"
-NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLO multiprocessing threads
+DEFAULT_CFG_PATH = WORKSPACE / "cfg/options/default.yaml"
+NUM_THREADS = min(32, max(1, os.cpu_count() - 1))  # number of YOLO multiprocessing threads
 AUTOINSTALL = str(os.getenv("YOLO_AUTOINSTALL", True)).lower() == "true"  # global auto-install mode
 VERBOSE = str(os.getenv("YOLO_VERBOSE", True)).lower() == "true"  # global verbose mode
 TQDM_BAR_FORMAT = "{l_bar}{bar:10}{r_bar}" if VERBOSE else None  # tqdm bar format
@@ -1298,17 +1298,18 @@ class SettingsManager(JSONDict):
         import uuid
 
         from ultralytics.utils.torch_utils import torch_distributed_zero_first
-        
-        root = WORKSPACE_DIR or Path()
-        datasets_root = (root if WORKSPACE_DIR and is_dir_writeable(root) else root.parent).resolve()
+
+        root = GIT_DIR or Path()
+        workspace = WORKSPACE_DIR or Path()
+        datasets_root = (root if GIT_DIR and is_dir_writeable(root) else workspace).resolve()
 
         self.file = Path(file)
         self.version = version
         self.defaults = {
             "settings_version": version,  # Settings schema version
             "datasets_dir": str(datasets_root / "datasets"),  # Datasets directory
-            "weights_dir": str(root / "weights"),  # Model weights directory
-            "runs_dir": str(root / "runs"),  # Experiment runs directory
+            "weights_dir": str(workspace / "weights"),  # Model weights directory
+            "runs_dir": str(workspace / "runs"),  # Experiment runs directory
             "uuid": hashlib.sha256(str(uuid.getnode()).encode()).hexdigest(),  # SHA-256 anonymized UUID hash
             "sync": True,  # Enable synchronization
             "api_key": "",  # Ultralytics API Key
