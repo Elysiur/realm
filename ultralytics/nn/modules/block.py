@@ -1964,3 +1964,121 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+
+class HRFuseBlock(nn.Module):
+    def __init__(self, c1, c2, nb):
+        super(HRFuseBlock, self).__init__()
+        self.num_branches = self._check_branches(c1, c2, nb)
+        self.branches = self._make_branches(c1, c2, nb)
+        self.fuse_layers = self._make_fuse_layers(c1, c2)
+    def _check_branches(self, c1, c2, nb):
+        assert len(c1) == len(c2) == len(nb) , "num of branches should be the same"
+        return len(nb)
+
+    def _make_branches(self, c1, c2, nb):
+        branches = nn.ModuleList(nn.Sequential(A2C2f(c1[idx],c2[idx]))for idx in range(self.num_branches))
+        return branches
+
+    def _make_fuse_layers(self, c1, c2):
+        if self.num_branches == 1:
+            return None
+        
+        fuse_layers = nn.ModuleList()
+        for i in range(self.num_branches):
+            fuse_layer = nn.ModuleList()
+            for j in range(self.num_branches):
+                if j > i:
+                    fuse_layer.append(
+                        nn.Sequential(
+                            Conv(c1[j],c1[i],1,1,0),
+                            nn.Upsample(scale_factor=2**(j-i), mode='nearest')
+                        )
+                    )
+                elif j == i:
+                    fuse_layer.append(None)
+                else: # j < i
+                    cvs = nn.Sequential()
+                    for k in range(i-j):
+                        if k == i - j - 1:
+                            cvs.append(Conv(c1[j],c1[i],3, 2, 1))
+                        else:
+                            cvs.append(Conv(c1[j],c1[j],3, 2, 1))
+                    fuse_layer.append(cvs)
+            # end fuse_layer
+            
+            fuse_layers.append(nn.ModuleList(fuse_layer))
+        #end fuse_layers
+        
+        return nn.ModuleList(fuse_layers)
+
+    def forward(self, x) -> list:
+        if self.num_branches == 1:
+            return [self.branches[0](x[0])]
+
+        for i in range(self.num_branches):
+            x[i] = self.branches[i](x[i])
+
+        x_fuse = []
+        for i in range(len(self.fuse_layers)):
+            y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
+            for j in range(1, self.num_branches):
+                if i == j:
+                    y = y + x[j]
+                else:
+                    y = y + self.fuse_layers[i][j](x[j])
+            x_fuse.append(y)
+
+        return x_fuse
+
+class HRBlock(nn.Module):
+    def __init__(self, c1, c2, n=1, nb=[]):
+        super(HRBlock, self).__init__()
+        c1, c2, nb = self._check_list(c1, c2, nb)
+        self.num_branches = len(nb)
+        self.transition = self._make_transition_layer(c1, c2)
+        self.stage = self._make_stage(c1, c2, n, nb)
+
+    def _check_list(self, *args):
+        return (arg if isinstance(arg, list) else [arg] for arg in args)
+
+    def _make_transition_layer(self, c1, c2):
+        num_branches_c1 = len(c1)
+        num_branches_c2 = len(c2)
+
+        transition_layers = []
+        for i in range(num_branches_c2):
+            if i < num_branches_c1:
+                if c2[i] != c1[i]:
+                    transition_layers.append(Conv(c1[i], c2[i], 3, 1, 1))
+                else:
+                    transition_layers.append(None)
+            else:
+                cvs = nn.Sequential()
+                for j in range(i+1-num_branches_c1):
+                    inchannels = c1[-1]
+                    outchannels = c2[i] if j == i-num_branches_c1 else inchannels
+                    cvs.append(Conv(inchannels, outchannels, 3, 1, 1))
+                transition_layers.append(cvs)
+
+        return nn.ModuleList(transition_layers)
+
+    def _make_stage(self, c1, c2, n=1, nb=[]):
+        fuses = nn.Sequential()
+        for i in range(n):
+            fuses.append(HRFuseBlock(c1, c2, nb))
+        return fuses
+    
+    def forward(self, x):
+        x = self._check_list(x)
+        y = []
+        
+        for i in range(self.num_branches):
+            if self.transition[i] is not None:
+                y.append(self.transition[i](x[-1]))
+            else:
+                y.append(x[i])
+
+        x = self.stage(y)
+        return x
