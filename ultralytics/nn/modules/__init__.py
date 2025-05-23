@@ -61,6 +61,7 @@ from .block import (
     TorchVision,
     HRFuseBlock,
     HRBlock,
+    HRDecoder,
 )
 from .conv import (
     CBAM,
@@ -183,4 +184,5 @@ __all__ = (
     "A2C2f",
     "HRFuseBlock",
     "HRBlock",
+    "HRDecoder",
 )

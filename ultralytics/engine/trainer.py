@@ -581,6 +581,7 @@ class BaseTrainer:
                 "obb",
             }:
                 data = check_det_dataset(self.args.data)
+                print(data)
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:

@@ -1846,14 +1846,16 @@ class A2C2f(nn.Module):
         """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
+        if(a2):
+            assert c_ % 16 == 0, "Dimension of ABlock be a multiple of 16."
 
+        n_head = min(8, c_ // 16)
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv((1 + n) * c_, c2, 1)
 
         self.gamma = nn.Parameter(0.01 * torch.ones(c2), requires_grad=True) if a2 and residual else None
         self.m = nn.ModuleList(
-            nn.Sequential(*(ABlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2)))
+            nn.Sequential(*(ABlock(c_, n_head, mlp_ratio, area) for _ in range(2)))
             if a2
             else C3k(c_, c_, 2, shortcut, g)
             for _ in range(n)
@@ -1968,20 +1970,30 @@ class SAVPE(nn.Module):
 
 
 class HRFuseBlock(nn.Module):
-    def __init__(self, c1, c2, nb):
+    def __init__(self,c2, nb):
         super(HRFuseBlock, self).__init__()
-        self.num_branches = self._check_branches(c1, c2, nb)
-        self.branches = self._make_branches(c1, c2, nb)
-        self.fuse_layers = self._make_fuse_layers(c1, c2)
-    def _check_branches(self, c1, c2, nb):
-        assert len(c1) == len(c2) == len(nb) , "num of branches should be the same"
-        return len(nb)
+        self.num_branches = len(nb)
+        self.branches = self._make_branches(c2, nb)
+        self.fuse_layers = self._make_fuse_layers(c2)
 
-    def _make_branches(self, c1, c2, nb):
-        branches = nn.ModuleList(nn.Sequential(A2C2f(c1[idx],c2[idx]))for idx in range(self.num_branches))
+    def _make_branches(self, c2, nb):
+        branches = nn.ModuleList(
+            nn.Sequential(*[
+                A2C2f(
+                    c2[idx],
+                    c2[idx],
+                    2,
+                    False,
+                    -1,
+                ) 
+                for _ in range(nb[idx])
+            ])
+            for idx in range(self.num_branches)
+        )
+        
         return branches
 
-    def _make_fuse_layers(self, c1, c2):
+    def _make_fuse_layers(self, c2):
         if self.num_branches == 1:
             return None
         
@@ -1992,7 +2004,7 @@ class HRFuseBlock(nn.Module):
                 if j > i:
                     fuse_layer.append(
                         nn.Sequential(
-                            Conv(c1[j],c1[i],1,1,0),
+                            Conv(c2[j],c2[i],1,1,0),
                             nn.Upsample(scale_factor=2**(j-i), mode='nearest')
                         )
                     )
@@ -2002,18 +2014,18 @@ class HRFuseBlock(nn.Module):
                     cvs = nn.Sequential()
                     for k in range(i-j):
                         if k == i - j - 1:
-                            cvs.append(Conv(c1[j],c1[i],3, 2, 1))
+                            cvs.append(Conv(c2[j],c2[i],3, 2, 1))
                         else:
-                            cvs.append(Conv(c1[j],c1[j],3, 2, 1))
+                            cvs.append(Conv(c2[j],c2[j],3, 2, 1))
                     fuse_layer.append(cvs)
             # end fuse_layer
             
-            fuse_layers.append(nn.ModuleList(fuse_layer))
+            fuse_layers.append(fuse_layer)
         #end fuse_layers
         
         return nn.ModuleList(fuse_layers)
 
-    def forward(self, x) -> list:
+    def forward(self, x) -> list[torch.Tensor]:
         if self.num_branches == 1:
             return [self.branches[0](x[0])]
 
@@ -2036,12 +2048,21 @@ class HRBlock(nn.Module):
     def __init__(self, c1, c2, n=1, nb=[]):
         super(HRBlock, self).__init__()
         c1, c2, nb = self._check_list(c1, c2, nb)
-        self.num_branches = len(nb)
+        self.num_branches = self._check_branches(c2, nb)
         self.transition = self._make_transition_layer(c1, c2)
-        self.stage = self._make_stage(c1, c2, n, nb)
+        self.stage = self._make_stage(c2, n, nb)
+        
+    def _check_branches(self, c2, nb):
+        assert len(c2) == len(nb) , "num of branches should follow the rules"
 
+        return len(nb)
+    
     def _check_list(self, *args):
-        return (arg if isinstance(arg, list) else [arg] for arg in args)
+        if len(args) == 1:
+            return [args[0]] if not isinstance(args[0], list) else args[0]
+        # otherwise
+
+        return [[arg] if not isinstance(arg, list) else arg for arg in args]
 
     def _make_transition_layer(self, c1, c2):
         num_branches_c1 = len(c1)
@@ -2059,18 +2080,15 @@ class HRBlock(nn.Module):
                 for j in range(i+1-num_branches_c1):
                     inchannels = c1[-1]
                     outchannels = c2[i] if j == i-num_branches_c1 else inchannels
-                    cvs.append(Conv(inchannels, outchannels, 3, 1, 1))
+                    cvs.append(Conv(inchannels, outchannels, 3, 2, 1))
                 transition_layers.append(cvs)
 
         return nn.ModuleList(transition_layers)
 
-    def _make_stage(self, c1, c2, n=1, nb=[]):
-        fuses = nn.Sequential()
-        for i in range(n):
-            fuses.append(HRFuseBlock(c1, c2, nb))
-        return fuses
+    def _make_stage(self, c2, n=1, nb=[]):
+        return nn.Sequential(*[HRFuseBlock(c2, nb) for _ in range(n)])
     
-    def forward(self, x):
+    def forward(self, x) -> list[torch.Tensor]:
         x = self._check_list(x)
         y = []
         
@@ -2079,6 +2097,28 @@ class HRBlock(nn.Module):
                 y.append(self.transition[i](x[-1]))
             else:
                 y.append(x[i])
-
+                
         x = self.stage(y)
         return x
+
+class HRDecoder(nn.Module):
+    def __init__(self, c1, c2, hc=[]):
+        super(HRDecoder,self).__init__()
+        self.num_branches = self._check_branches(c1, hc)
+        self.increment = nn.ModuleList(A2C2f(c1[i], hc[i], 1, False, -1) for i in range(self.num_branches))
+        self.downsample = nn.ModuleList(Conv(hc[i],hc[i+1],3,2,1) for i in range(self.num_branches-1))
+        self.layer = Conv(hc[-1], c2, 1, 1, 0)
+    
+    def _check_branches(self, c1, hc):
+        assert len(c1) == len(hc) , "num of branches should be the same"
+
+        return len(c1)
+    
+    def forward(self, x) -> torch.Tensor:
+        y = self.increment[0](x[0])
+        
+        for i in range(1, self.num_branches):
+            y = self.downsample[i-1](y) + self.increment[i](x[i])
+        
+        y = self.layer(y)
+        return y
