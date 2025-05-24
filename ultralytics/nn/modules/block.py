@@ -1968,25 +1968,9 @@ class SAVPE(nn.Module):
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
-class SpatialWeighting(nn.Module):
-    """
-    Spatial Weighting module with attention for feature enhancement.
-    """
 
-    def __init__(self, c1, c2, e=0.5):
-        super()
-        c_ = int(c1 * e)
-        
-    
-    def forward(self, x):
-        pass
 
-class LiteShuffleBlock(nn.Module):
-    def __init__(self, c1, c2, e=0.5):
-        super().__init__()
-    
-    def forward(self, x):
-        pass
+
     
 
 class HRFuseBlock(nn.Module):
@@ -1999,7 +1983,7 @@ class HRFuseBlock(nn.Module):
     def _make_branches(self, c2, nb):
         branches = nn.ModuleList(
             nn.Sequential(*[
-                C3(c2[idx],c2[idx]) 
+                C3(c2[idx],c2[idx],e=0.25) 
                 for _ in range(nb[idx])
             ])
             for idx in range(self.num_branches)
@@ -2083,7 +2067,7 @@ class HRFuseBlock(nn.Module):
             for i in range(len(self.fuse_layers))
         ]
 
-        return fuse
+        return x
 
 class HRBlock(nn.Module):
     def __init__(self, c1, c2, n=1, nb=[], lite=False):
@@ -2113,7 +2097,12 @@ class HRBlock(nn.Module):
         for i in range(num_branches_c2):
             if i < num_branches_c1:
                 if c2[i] != c1[i]:
-                    transition_layers.append(Conv(c1[i], c2[i], 3, 1, 1))
+                    transition_layers.append(
+                        nn.Sequential(
+                            DWConv(c1[i], c1[i], 3, 1),
+                            Conv(c1[i], c2[i], 1, 1, 0)
+                        )
+                    )
                 else:
                     transition_layers.append(nn.Identity())
             else:
@@ -2121,7 +2110,12 @@ class HRBlock(nn.Module):
                 for j in range(i+1-num_branches_c1):
                     inchannels = c1[-1]
                     outchannels = c2[i] if j == i-num_branches_c1 else inchannels
-                    cvs.append(Conv(inchannels, outchannels, 3, 2, 1))
+                    cvs.append(
+                        nn.Sequential(
+                            DWConv(inchannels, inchannels, 3, 2),
+                            Conv(inchannels, outchannels, 1, 1, 0)
+                        )
+                    )
                 transition_layers.append(cvs)
 
         return nn.ModuleList(transition_layers)
@@ -2146,11 +2140,15 @@ class HRDecoder(nn.Module):
     def __init__(self, c1, c2, hc=[]):
         super().__init__()
         self.num_branches = self._check_branches(c1, hc)
-        self.increment = nn.ModuleList(C3(c1[i], hc[i]) for i in range(self.num_branches))
+        self.increment = nn.ModuleList(C3(c1[i], hc[i],e=0.25) for i in range(self.num_branches))
         self.downsample = nn.ModuleList(
-            nn.Sequential(
-                *[Conv(hc[j-1],hc[j],3,2,1) for j in range(i+1,self.num_branches)]
-            )
+            nn.Sequential(*[
+                nn.Sequential(
+                    DWConv(hc[j-1],hc[j],3,2,1),
+                    Conv(hc[j],hc[j],1,1,0)
+                )
+                for j in range(i+1,self.num_branches)
+            ])
             if i != self.num_branches
             else nn.Identity()
             for i in range(self.num_branches)
@@ -2170,3 +2168,4 @@ class HRDecoder(nn.Module):
         y = self.layer(y)
         
         return y
+
