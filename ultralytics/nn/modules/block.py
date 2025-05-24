@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -499,7 +500,7 @@ class BottleneckCSP(nn.Module):
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
         self.act = nn.SiLU()
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(C3k(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
         """Apply CSP bottleneck with 3 convolutions."""
@@ -1847,9 +1848,9 @@ class A2C2f(nn.Module):
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         if(a2):
-            assert c_ % 16 == 0, "Dimension of ABlock be a multiple of 16."
+            assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
 
-        n_head = min(8, c_ // 16)
+        n_head = min(8, c_ // 32)
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv((1 + n) * c_, c2, 1)
 
@@ -1967,25 +1968,38 @@ class SAVPE(nn.Module):
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
+class SpatialWeighting(nn.Module):
+    """
+    Spatial Weighting module with attention for feature enhancement.
+    """
 
+    def __init__(self, c1, c2, e=0.5):
+        super()
+        c_ = int(c1 * e)
+        
+    
+    def forward(self, x):
+        pass
+
+class LiteShuffleBlock(nn.Module):
+    def __init__(self, c1, c2, e=0.5):
+        super().__init__()
+    
+    def forward(self, x):
+        pass
+    
 
 class HRFuseBlock(nn.Module):
-    def __init__(self,c2, nb):
-        super(HRFuseBlock, self).__init__()
+    def __init__(self,c2, nb, lite=False):
+        super().__init__()
         self.num_branches = len(nb)
-        self.branches = self._make_branches(c2, nb)
+        self.branches = self._make_branches(c2, nb) if not lite else self._make_lite_branches(c2, nb)
         self.fuse_layers = self._make_fuse_layers(c2)
 
     def _make_branches(self, c2, nb):
         branches = nn.ModuleList(
             nn.Sequential(*[
-                A2C2f(
-                    c2[idx],
-                    c2[idx],
-                    2,
-                    False,
-                    -1,
-                ) 
+                C3(c2[idx],c2[idx]) 
                 for _ in range(nb[idx])
             ])
             for idx in range(self.num_branches)
@@ -1993,9 +2007,29 @@ class HRFuseBlock(nn.Module):
         
         return branches
 
+    def _make_lite_branches(self, c2, nb):
+        """
+        Make LiteShuffleBlock branches with weighting blocks,
+        stands for, conditional channel weighting.
+
+        Args:
+            c2 (_type_): _description_
+            nb (_type_): _description_
+        """
+
+        branches = nn.ModuleList(
+            nn.Sequential(*[
+                LiteShuffleBlock(c2[idx],c2[idx]) 
+                for _ in range(nb[idx])
+            ])
+            for idx in range(self.num_branches)
+        )
+
+        return branches
+
     def _make_fuse_layers(self, c2):
         if self.num_branches == 1:
-            return None
+            return nn.Identity()
         
         fuse_layers = nn.ModuleList()
         for i in range(self.num_branches):
@@ -2009,48 +2043,55 @@ class HRFuseBlock(nn.Module):
                         )
                     )
                 elif j == i:
-                    fuse_layer.append(None)
+                    fuse_layer.append(nn.Identity())
                 else: # j < i
                     cvs = nn.Sequential()
                     for k in range(i-j):
                         if k == i - j - 1:
-                            cvs.append(Conv(c2[j],c2[i],3, 2, 1))
+                            cvs.append(
+                                nn.Sequential(
+                                    DWConv(c2[j],c2[j],3,2),
+                                    Conv(c2[j],c2[i],1,1,0)
+                                )
+                            )
                         else:
-                            cvs.append(Conv(c2[j],c2[j],3, 2, 1))
+                            cvs.append(
+                                nn.Sequential(
+                                    DWConv(c2[j],c2[j],3,2),
+                                    Conv(c2[j],c2[j],1,1,0)
+                                )
+                            )
                     fuse_layer.append(cvs)
             # end fuse_layer
-            
+
             fuse_layers.append(fuse_layer)
         #end fuse_layers
+
+        #overwrite fuse_layers[0][0]
+        fuse_layers[0][0] = nn.Identity()
         
         return nn.ModuleList(fuse_layers)
 
     def forward(self, x) -> list[torch.Tensor]:
-        if self.num_branches == 1:
-            return [self.branches[0](x[0])]
+        x = [self.branches[i](x[i]) for i in range(self.num_branches)]
 
-        for i in range(self.num_branches):
-            x[i] = self.branches[i](x[i])
+        fuse = [
+            torch.sum(torch.stack([
+                self.fuse_layers[i][j](x[j])
+                for j in range(self.num_branches)
+            ], dim=0),dim=0)
+            for i in range(len(self.fuse_layers))
+        ]
 
-        x_fuse = []
-        for i in range(len(self.fuse_layers)):
-            y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
-            for j in range(1, self.num_branches):
-                if i == j:
-                    y = y + x[j]
-                else:
-                    y = y + self.fuse_layers[i][j](x[j])
-            x_fuse.append(y)
-
-        return x_fuse
+        return fuse
 
 class HRBlock(nn.Module):
-    def __init__(self, c1, c2, n=1, nb=[]):
-        super(HRBlock, self).__init__()
+    def __init__(self, c1, c2, n=1, nb=[], lite=False):
+        super().__init__()
         c1, c2, nb = self._check_list(c1, c2, nb)
         self.num_branches = self._check_branches(c2, nb)
         self.transition = self._make_transition_layer(c1, c2)
-        self.stage = self._make_stage(c2, n, nb)
+        self.stage = self._make_stage(c2, n, nb, lite)
         
     def _check_branches(self, c2, nb):
         assert len(c2) == len(nb) , "num of branches should follow the rules"
@@ -2074,7 +2115,7 @@ class HRBlock(nn.Module):
                 if c2[i] != c1[i]:
                     transition_layers.append(Conv(c1[i], c2[i], 3, 1, 1))
                 else:
-                    transition_layers.append(None)
+                    transition_layers.append(nn.Identity())
             else:
                 cvs = nn.Sequential()
                 for j in range(i+1-num_branches_c1):
@@ -2085,40 +2126,47 @@ class HRBlock(nn.Module):
 
         return nn.ModuleList(transition_layers)
 
-    def _make_stage(self, c2, n=1, nb=[]):
-        return nn.Sequential(*[HRFuseBlock(c2, nb) for _ in range(n)])
+    def _make_stage(self, c2, n=1, nb=[], lite=False):
+        return nn.Sequential(*[HRFuseBlock(c2, nb, lite) for _ in range(n)])
     
     def forward(self, x) -> list[torch.Tensor]:
         x = self._check_list(x)
-        y = []
-        
-        for i in range(self.num_branches):
-            if self.transition[i] is not None:
-                y.append(self.transition[i](x[-1]))
-            else:
-                y.append(x[i])
-                
+
+        y = [
+            self.transition[i](x[i])
+            if i < len(x) else self.transition[i](x[-1])
+            for i in range(self.num_branches)
+        ]
+
         x = self.stage(y)
+        
         return x
 
 class HRDecoder(nn.Module):
     def __init__(self, c1, c2, hc=[]):
-        super(HRDecoder,self).__init__()
+        super().__init__()
         self.num_branches = self._check_branches(c1, hc)
-        self.increment = nn.ModuleList(A2C2f(c1[i], hc[i], 1, False, -1) for i in range(self.num_branches))
-        self.downsample = nn.ModuleList(Conv(hc[i],hc[i+1],3,2,1) for i in range(self.num_branches-1))
+        self.increment = nn.ModuleList(C3(c1[i], hc[i]) for i in range(self.num_branches))
+        self.downsample = nn.ModuleList(
+            nn.Sequential(
+                *[Conv(hc[j-1],hc[j],3,2,1) for j in range(i+1,self.num_branches)]
+            )
+            if i != self.num_branches
+            else nn.Identity()
+            for i in range(self.num_branches)
+        )
         self.layer = Conv(hc[-1], c2, 1, 1, 0)
-    
+
     def _check_branches(self, c1, hc):
         assert len(c1) == len(hc) , "num of branches should be the same"
 
         return len(c1)
     
     def forward(self, x) -> torch.Tensor:
-        y = self.increment[0](x[0])
-        
-        for i in range(1, self.num_branches):
-            y = self.downsample[i-1](y) + self.increment[i](x[i])
-        
+        x = [self.increment[i](x[i]) for i in range(self.num_branches)]
+
+        y = torch.sum(torch.stack([self.downsample[i](x[i]) for i in range(self.num_branches)],dim=0), dim=0)
+
         y = self.layer(y)
+        
         return y

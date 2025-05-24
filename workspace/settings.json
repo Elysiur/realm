@@ -14,7 +14,7 @@
   "mlflow": true,
   "neptune": true,
   "raytune": true,
-  "tensorboard": false,
+  "tensorboard": true,
   "wandb": false,
   "vscode_msg": true
 }
