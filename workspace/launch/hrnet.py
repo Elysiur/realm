@@ -3,9 +3,9 @@ sys.path.append('')
 
 from ultralytics import YOLO
 from ultralytics import SETTINGS
-model = YOLO('hrnet.pt', task='pose')
+model = YOLO('hrnet.yaml', task='pose')
 SETTINGS['tensorboard'] = True
-model.train(data='hand-keypoints.yaml', cfg="hrnet-example.yaml", epochs=120, plots=True)
+model.train(data='hand-keypoints.yaml', cfg="hrnet-example.yaml", epochs=120, plots=True, visualize=True)
 SETTINGS['tensorboard'] = False
 model.val()
 # model.export(format='onnx')

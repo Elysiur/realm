@@ -76,8 +76,6 @@ class PoseValidator(DetectionValidator):
         self.kpt_shape = None
         self.args.task = "pose"
         self.metrics = PoseMetrics(save_dir=self.save_dir)
-        self.iouv = torch.linspace(0.5,0.1,9)
-        self.niou = self.iouv.numel()
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
