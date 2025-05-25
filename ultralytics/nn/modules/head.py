@@ -568,6 +568,25 @@ class YOLOESegment(YOLOEDetect):
 
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
+class DETR(nn.Module):
+    """
+    Deformable Transformer Decoder (DeformableTransformerDecoder) head for object detection.
+
+    This decoder head utilizes Transformer architecture along with deformable convolutions to predict bounding boxes
+    and class labels for objects in an image. It integrates features from multiple layers and runs through a series of
+    Transformer decoder layers to output the final predictions.
+    """
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+    
+    def forward(self, x):
+        pass
+    
+    def encoder(self, x):
+        pass
+
+    
+    
 
 class RTDETRDecoder(nn.Module):
     """

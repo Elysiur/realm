@@ -1968,10 +1968,60 @@ class SAVPE(nn.Module):
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
+class ShuffleBlockv2(nn.Module):
+    def __init__(self, c1, c2, s=1):
+        """_summary_
+            Args:
+                c1 (_type_): _description_
+                c2 (_type_): _description_
+                n (int, optional): _description_. Defaults to 1.
+                
+            Notice:
+                In most cases, make sure c1 == c2. else use "downsample=True" See:
+                ShuffleNet V2: Practical Guidelines for Efficient CNN Architecture Design
+                https://arxiv.org/abs/1807.11164
+        """
 
+        super().__init__()
 
+        c_ = c1 // 2
+        
+        self.branch1 = nn.Sequential(
+            Conv(c_, c_, 1, 1, 0),
+            DWConv(c_, c_, 3, s),
+            Conv(c_, c_, 1, 1, 0)
+        )
+        
+        self.branch2 = nn.Sequential(
+            DWConv(c_, c_, 3, s),
+            Conv(c_, c_, 1, 1, 0)
+        ) \
+        if s > 1 else nn.Identity()
 
-    
+        self.conv = Conv(c1, c2, 1, 1, 0) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        y = torch.chunk(x, 2, dim=1)
+
+        x = torch.cat([self.branch1(y[0]), self.branch2(y[1])], dim=1)
+        
+        x = self._channel_shuffle(x,2)
+        
+        x = self.conv(x)
+
+        return x
+
+    def _channel_shuffle(self, x, g=2):
+        B, C, H, W = x.shape
+        c_ = C // g
+
+        x = x.view(B, g, c_, H, W)
+
+        x = torch.transpose(x, 1, 2).contiguous()
+
+        x = x.view(B, C, H, W)
+
+        return x
 
 class HRFuseBlock(nn.Module):
     def __init__(self,c2, nb, lite=False):
@@ -1983,27 +2033,7 @@ class HRFuseBlock(nn.Module):
     def _make_branches(self, c2, nb):
         branches = nn.ModuleList(
             nn.Sequential(*[
-                C3(c2[idx],c2[idx],e=0.25) 
-                for _ in range(nb[idx])
-            ])
-            for idx in range(self.num_branches)
-        )
-        
-        return branches
-
-    def _make_lite_branches(self, c2, nb):
-        """
-        Make LiteShuffleBlock branches with weighting blocks,
-        stands for, conditional channel weighting.
-
-        Args:
-            c2 (_type_): _description_
-            nb (_type_): _description_
-        """
-
-        branches = nn.ModuleList(
-            nn.Sequential(*[
-                LiteShuffleBlock(c2[idx],c2[idx]) 
+                ShuffleBlockv2(c2[idx],c2[idx]) 
                 for _ in range(nb[idx])
             ])
             for idx in range(self.num_branches)
@@ -2033,17 +2063,11 @@ class HRFuseBlock(nn.Module):
                     for k in range(i-j):
                         if k == i - j - 1:
                             cvs.append(
-                                nn.Sequential(
-                                    DWConv(c2[j],c2[j],3,2),
-                                    Conv(c2[j],c2[i],1,1,0)
-                                )
+                                ShuffleBlockv2(c2[j],c2[i],2)
                             )
                         else:
                             cvs.append(
-                                nn.Sequential(
-                                    DWConv(c2[j],c2[j],3,2),
-                                    Conv(c2[j],c2[j],1,1,0)
-                                )
+                                ShuffleBlockv2(c2[j],c2[j],2)
                             )
                     fuse_layer.append(cvs)
             # end fuse_layer
@@ -2097,12 +2121,7 @@ class HRBlock(nn.Module):
         for i in range(num_branches_c2):
             if i < num_branches_c1:
                 if c2[i] != c1[i]:
-                    transition_layers.append(
-                        nn.Sequential(
-                            DWConv(c1[i], c1[i], 3, 1),
-                            Conv(c1[i], c2[i], 1, 1, 0)
-                        )
-                    )
+                    transition_layers.append(ShuffleBlockv2(c1[i], c2[i],1))
                 else:
                     transition_layers.append(nn.Identity())
             else:
@@ -2110,12 +2129,7 @@ class HRBlock(nn.Module):
                 for j in range(i+1-num_branches_c1):
                     inchannels = c1[-1]
                     outchannels = c2[i] if j == i-num_branches_c1 else inchannels
-                    cvs.append(
-                        nn.Sequential(
-                            DWConv(inchannels, inchannels, 3, 2),
-                            Conv(inchannels, outchannels, 1, 1, 0)
-                        )
-                    )
+                    cvs.append(ShuffleBlockv2(inchannels, outchannels,2))
                 transition_layers.append(cvs)
 
         return nn.ModuleList(transition_layers)
@@ -2140,13 +2154,10 @@ class HRDecoder(nn.Module):
     def __init__(self, c1, c2, hc=[]):
         super().__init__()
         self.num_branches = self._check_branches(c1, hc)
-        self.increment = nn.ModuleList(C3(c1[i], hc[i],e=0.25) for i in range(self.num_branches))
+        self.increment = nn.ModuleList(ShuffleBlockv2(c1[i], hc[i]) for i in range(self.num_branches))
         self.downsample = nn.ModuleList(
             nn.Sequential(*[
-                nn.Sequential(
-                    DWConv(hc[j-1],hc[j],3,2,1),
-                    Conv(hc[j],hc[j],1,1,0)
-                )
+                ShuffleBlockv2(hc[j-1],hc[j],2)
                 for j in range(i+1,self.num_branches)
             ])
             if i != self.num_branches
