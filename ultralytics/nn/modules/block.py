@@ -2013,6 +2013,9 @@ class ShuffleBlockv2(nn.Module):
 
     def _channel_shuffle(self, x, g=2):
         B, C, H, W = x.shape
+
+        assert C % g == 0, "channel must be divided by groups"
+
         c_ = C // g
 
         x = x.view(B, g, c_, H, W)
@@ -2024,22 +2027,21 @@ class ShuffleBlockv2(nn.Module):
         return x
 
 class HRFuseBlock(nn.Module):
-    def __init__(self,c2, nb, lite=False):
+    def __init__(self,c2, nb):
         super().__init__()
         self.num_branches = len(nb)
-        self.branches = self._make_branches(c2, nb) if not lite else self._make_lite_branches(c2, nb)
+        self.branches = self._make_branches(c2, nb)
         self.fuse_layers = self._make_fuse_layers(c2)
+        self.fuse_shuffle = self._make_fuse_shuffle(c2)
 
     def _make_branches(self, c2, nb):
-        branches = nn.ModuleList(
+        return nn.ModuleList(
             nn.Sequential(*[
                 ShuffleBlockv2(c2[idx],c2[idx]) 
                 for _ in range(nb[idx])
             ])
             for idx in range(self.num_branches)
         )
-
-        return branches
 
     def _make_fuse_layers(self, c2):
         if self.num_branches == 1:
@@ -2057,18 +2059,14 @@ class HRFuseBlock(nn.Module):
                         )
                     )
                 elif j == i:
-                    fuse_layer.append(nn.Identity())
+                    fuse_layer.append(nn.Identity() if c2[j] == c2[i] else Conv(c2[j],c2[i],1,1,0))
                 else: # j < i
                     cvs = nn.Sequential()
                     for k in range(i-j):
                         if k == i - j - 1:
-                            cvs.append(
-                                ShuffleBlockv2(c2[j],c2[i],2)
-                            )
+                            cvs.append(ShuffleBlockv2(c2[j],c2[i],2))
                         else:
-                            cvs.append(
-                                ShuffleBlockv2(c2[j],c2[j],2)
-                            )
+                            cvs.append(ShuffleBlockv2(c2[j],c2[j],2))
                     fuse_layer.append(cvs)
             # end fuse_layer
 
@@ -2080,26 +2078,34 @@ class HRFuseBlock(nn.Module):
         
         return nn.ModuleList(fuse_layers)
 
+    def _make_fuse_shuffle(self, c2):
+        return nn.ModuleList(
+            nn.Sequential(*[
+                ShuffleBlockv2(c2[idx]*self.num_branches,c2[idx]),
+                ShuffleBlockv2(c2[idx],c2[idx])
+            ])
+            for idx in range(self.num_branches)
+        )
+
     def forward(self, x) -> list[torch.Tensor]:
         x = [self.branches[i](x[i]) for i in range(self.num_branches)]
 
         fuse = [
-            torch.sum(torch.stack([
-                self.fuse_layers[i][j](x[j])
-                for j in range(self.num_branches)
-            ], dim=0),dim=0)
-            for i in range(len(self.fuse_layers))
+            torch.cat([self.fuse_layers[i][j](x[j]) for j in range(self.num_branches)], dim=1)
+            for i in range(self.num_branches)
         ]
 
-        return x
+        shuffle = [self.fuse_shuffle[i](fuse[i]) for i in range(self.num_branches)]
+
+        return shuffle
 
 class HRBlock(nn.Module):
-    def __init__(self, c1, c2, n=1, nb=[], lite=False):
+    def __init__(self, c1, c2, n=1, nb=[]):
         super().__init__()
         c1, c2, nb = self._check_list(c1, c2, nb)
         self.num_branches = self._check_branches(c2, nb)
         self.transition = self._make_transition_layer(c1, c2)
-        self.stage = self._make_stage(c2, n, nb, lite)
+        self.stage = self._make_stage(c2, n, nb)
         
     def _check_branches(self, c2, nb):
         assert len(c2) == len(nb) , "num of branches should follow the rules"
@@ -2134,15 +2140,15 @@ class HRBlock(nn.Module):
 
         return nn.ModuleList(transition_layers)
 
-    def _make_stage(self, c2, n=1, nb=[], lite=False):
-        return nn.Sequential(*[HRFuseBlock(c2, nb, lite) for _ in range(n)])
+    def _make_stage(self, c2, n=1, nb=[]):
+        return nn.Sequential(*[HRFuseBlock(c2, nb) for _ in range(n)])
     
     def forward(self, x) -> list[torch.Tensor]:
         x = self._check_list(x)
 
         y = [
             self.transition[i](x[i])
-            if i < len(x) else self.transition[i](x[-1])
+            if i < self.num_branches-1 else self.transition[i](x[-1])
             for i in range(self.num_branches)
         ]
 
@@ -2153,18 +2159,27 @@ class HRBlock(nn.Module):
 class HRDecoder(nn.Module):
     def __init__(self, c1, c2, hc=[]):
         super().__init__()
+
         self.num_branches = self._check_branches(c1, hc)
+
         self.increment = nn.ModuleList(ShuffleBlockv2(c1[i], hc[i]) for i in range(self.num_branches))
-        self.downsample = nn.ModuleList(
-            nn.Sequential(*[
-                ShuffleBlockv2(hc[j-1],hc[j],2)
-                for j in range(i+1,self.num_branches)
-            ])
-            if i != self.num_branches
+
+        self.upsample = nn.ModuleList(
+            nn.Upsample(scale_factor=2**i, mode='nearest')
+            if i != 0
             else nn.Identity()
-            for i in range(self.num_branches)
+            for i in range(0, self.num_branches)
         )
-        self.layer = Conv(hc[-1], c2, 1, 1, 0)
+
+        c_sum = sum(c1)
+        c_ = 2 ** (math.floor(math.log2(c_sum))-1)
+
+        self.layer = nn.Sequential(
+            ShuffleBlockv2(c_sum,c_),
+            ShuffleBlockv2(c_,c_),
+            Conv(c_,c2,3,1,1),
+            A2C2f(c2,c2,2,False,-1)
+        )
 
     def _check_branches(self, c1, hc):
         assert len(c1) == len(hc) , "num of branches should be the same"
@@ -2174,7 +2189,7 @@ class HRDecoder(nn.Module):
     def forward(self, x) -> torch.Tensor:
         x = [self.increment[i](x[i]) for i in range(self.num_branches)]
 
-        y = torch.sum(torch.stack([self.downsample[i](x[i]) for i in range(self.num_branches)],dim=0), dim=0)
+        y = torch.cat([self.upsample[i](x[i]) for i in range(self.num_branches)], dim=1)
 
         y = self.layer(y)
         

@@ -86,6 +86,7 @@ from .head import (
     LRPCHead,
     Pose,
     RTDETRDecoder,
+    DINOv2Pose,
     Segment,
     WorldDetect,
     YOLOEDetect,
@@ -151,6 +152,7 @@ __all__ = (
     "TransformerEncoderLayer",
     "RepC3",
     "RTDETRDecoder",
+    "DINOv2Pose"
     "AIFI",
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
