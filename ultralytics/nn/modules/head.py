@@ -244,6 +244,9 @@ class Pose(Detect):
 
     def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
         """Initialize YOLO network with default parameters and Convolutional Layers."""
+        # ISSUE: `ch` is a list of channel sizes for each detection layer, e.g. [256, 512, 1024]. no more support.
+        # TO DO: add support for multiple input to avoid dynamic compute graph
+        ch = ch[0]
         super().__init__(nc, ch)
         self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
@@ -253,6 +256,7 @@ class Pose(Detect):
 
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
+        x = x[0]
         bs = x[0].shape[0]  # batch size
         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
         x = Detect.forward(self, x)

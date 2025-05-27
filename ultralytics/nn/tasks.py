@@ -68,6 +68,7 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    HREncoder,
     HRBlock,
     HRDecoder,
 )

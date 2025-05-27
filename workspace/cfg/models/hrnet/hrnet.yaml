@@ -3,7 +3,7 @@ nc: 1 # number of classes
 kpt_shape: [21, 3]
 scales: # model compound scaling constants.
   # [depth, width, max_channels]
-  w18v2: [1.0, 1.0, 1024] # Just a super large model.
+  w32: [1.0, 1.0, 1024] # Just a super large model.
 
 backbone:
   # [from, repeats, module, args]
@@ -26,10 +26,12 @@ head:
   - [[-1, 3], 1, Concat, [1]] # cat backbone P2/4
   - [-1, 1, A2C2f, [64, False, 1]]
 
-  - [-1, 1, HRBlock, [[32,64],[2,2]]] # 14-P3/8
-  - [-1, 3, HRBlock, [[32,64,128],[2,2,2]]] # 15-P4/16
-  - [-1, 2, HRBlock, [[32,64,128,256],[2,2,2,2]]] # 16-P5/32
+  - [-1, 1, HREncoder, [1]] # 14
 
-  - [-1, 1, HRDecoder, [128,[32,64,128,256]]] # 17-P2/4
+  - [-1, 1, HRBlock, [[32,64],[2,2]]] # 15-P3/8
+  - [-1, 3, HRBlock, [[32,64,128],[2,2,2]]] # 16-P4/16
+  - [-1, 2, HRBlock, [[32,64,128,256],[2,2,2,2]]] # 17-P5/32
 
-  - [[-1], 1, Pose, [nc, kpt_shape]] # 18-Detect
+  - [-1, 1, HRDecoder, [[128,256,512,512]]] # 18-P2/4
+
+  - [[-1], 1, Pose, [nc, kpt_shape]] # 19-Detect

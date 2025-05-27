@@ -40,9 +40,6 @@ def _log_scalars(scalars: dict, step: int = 0) -> None:
             WRITER.add_scalar(k, v, step)
 
 
-def _log_tensorboard_featuremaps(im) -> None:
-    pass # TODO: implement
-
 def _log_tensorboard_graph(trainer) -> None:
     """
     Log model graph to TensorBoard.

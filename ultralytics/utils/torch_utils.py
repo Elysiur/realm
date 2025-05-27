@@ -344,11 +344,14 @@ def model_info(model, detailed=False, verbose=True, imgsz=640):
             else:  # layers with no learnable params
                 LOGGER.info(f"{i:>5g}{mn:>40}{mt:>20}{False!r:>10}{0:>12g}{str([]):>20}{'-':>10}{'-':>10}{'-':>15}")
 
-    flops = get_flops(model, imgsz)  # imgsz may be int or list, i.e. imgsz=640 or imgsz=[640, 320]
+    # flops = get_flops(model, imgsz)  # imgsz may be int or list, i.e. imgsz=640 or imgsz=[640, 320]
+    # if not flops:
+    flops = get_flops_with_torch_profiler(model, imgsz)
     fused = " (fused)" if getattr(model, "is_fused", lambda: False)() else ""
     fs = f", {flops:.1f} GFLOPs" if flops else ""
     yaml_file = getattr(model, "yaml_file", "") or getattr(model, "yaml", {}).get("yaml_file", "")
     model_name = Path(yaml_file).stem.replace("yolo", "YOLO") or "Model"
+    LOGGER.info("")
     LOGGER.info(f"{model_name} summary{fused}: {n_l:,} layers, {n_p:,} parameters, {n_g:,} gradients{fs}")
     return n_l, n_p, n_g, flops
 
@@ -467,7 +470,7 @@ def get_flops_with_torch_profiler(model, imgsz=640):
     except Exception:
         # Use actual image size for input tensor (i.e. required for RTDETR models)
         im = torch.empty((1, p.shape[1], *imgsz), device=p.device)  # input image in BCHW format
-        with torch.profiler.profile(with_flops=True) as prof:
+        with torch.profiler.profile(with_flops=True,) as prof:
             model(im)
         flops = sum(x.flops for x in prof.key_averages()) / 1e9
     return flops
