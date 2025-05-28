@@ -88,6 +88,10 @@ class YOLO(Model):
             },
         }
 
+class HRNet(YOLO):
+    def __init__(self, model="", task=None, verbose=False):
+        super().__init__(model=model, task=task, verbose=verbose)
+
 class DETR(YOLO):
     def __init__(self, model="", task=None, verbose=False):
         super().__init__(model=model, task=task, verbose=verbose)
