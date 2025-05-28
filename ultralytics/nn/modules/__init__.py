@@ -59,6 +59,10 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    HREncoder,
+    HRFuseBlock,
+    HRBlock,
+    HRDecoder,
 )
 from .conv import (
     CBAM,
@@ -83,6 +87,7 @@ from .head import (
     LRPCHead,
     Pose,
     RTDETRDecoder,
+    DINOv2Pose,
     Segment,
     WorldDetect,
     YOLOEDetect,
@@ -148,6 +153,7 @@ __all__ = (
     "TransformerEncoderLayer",
     "RepC3",
     "RTDETRDecoder",
+    "DINOv2Pose"
     "AIFI",
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
@@ -179,4 +185,8 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "HREncoder",
+    "HRFuseBlock",
+    "HRBlock",
+    "HRDecoder",
 )

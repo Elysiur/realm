@@ -11,11 +11,10 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
-
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
-from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
-from .utils import bias_init_with_prob, linear_init
+from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer, DeformableTransformerPoseDecoder
+from .utils import bias_init_with_prob, linear_init, inverse_sigmoid
 
 __all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
@@ -245,6 +244,9 @@ class Pose(Detect):
 
     def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
         """Initialize YOLO network with default parameters and Convolutional Layers."""
+        # ISSUE: `ch` is a list of channel sizes for each detection layer, e.g. [256, 512, 1024]. no more support.
+        # TO DO: add support for multiple input to avoid dynamic compute graph
+        ch = ch[0]
         super().__init__(nc, ch)
         self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
@@ -254,6 +256,7 @@ class Pose(Detect):
 
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
+        x = x[0]
         bs = x[0].shape[0]  # batch size
         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
         x = Detect.forward(self, x)
@@ -568,7 +571,6 @@ class YOLOESegment(YOLOEDetect):
 
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
-
 class RTDETRDecoder(nn.Module):
     """
     Real-Time Deformable Transformer Decoder (RTDETRDecoder) module for object detection.
@@ -584,17 +586,17 @@ class RTDETRDecoder(nn.Module):
         self,
         nc=80,
         ch=(512, 1024, 2048),
-        hd=256,  # hidden dim
-        nq=300,  # num queries
-        ndp=4,  # num decoder points
-        nh=8,  # num head
-        ndl=6,  # num decoder layers
-        d_ffn=1024,  # dim of feedforward
+        h_dims=256,  # hidden dim
+        n_query=300,  # num queries
+        n_dp=4,  # num decoder points
+        n_heads=8,  # num head
+        n_decoders=6,  # num decoder layers
+        d_ff=1024,  # dim of feedforward
         dropout=0.0,
         act=nn.ReLU(),
         eval_idx=-1,
         # Training args
-        nd=100,  # num denoising
+        n_denoising=100,  # num denoising
         label_noise_ratio=0.5,
         box_noise_scale=1.0,
         learnt_init_query=False,
@@ -605,12 +607,12 @@ class RTDETRDecoder(nn.Module):
         Args:
             nc (int): Number of classes. Default is 80.
             ch (tuple): Channels in the backbone feature maps. Default is (512, 1024, 2048).
-            hd (int): Dimension of hidden layers. Default is 256.
-            nq (int): Number of query points. Default is 300.
+            h_dims (int): Dimension of hidden layers. Default is 256.
+            n_query (int): Number of query points. Default is 300.
             ndp (int): Number of decoder points. Default is 4.
             nh (int): Number of heads in multi-head attention. Default is 8.
-            ndl (int): Number of decoder layers. Default is 6.
-            d_ffn (int): Dimension of the feed-forward networks. Default is 1024.
+            n_decoders (int): Number of decoder layers. Default is 6.
+            d_ff (int): Dimension of the feed-forward networks. Default is 1024.
             dropout (float): Dropout rate. Default is 0.0.
             act (nn.Module): Activation function. Default is nn.ReLU.
             eval_idx (int): Evaluation index. Default is -1.
@@ -620,42 +622,42 @@ class RTDETRDecoder(nn.Module):
             learnt_init_query (bool): Whether to learn initial query embeddings. Default is False.
         """
         super().__init__()
-        self.hidden_dim = hd
-        self.nhead = nh
+        self.hidden_dim = h_dims
+        self.nhead = n_heads
         self.nl = len(ch)  # num level
         self.nc = nc
-        self.num_queries = nq
-        self.num_decoder_layers = ndl
-
+        self.num_queries = n_query
+        self.num_decoder_layers = n_decoders
+        self.n_dp = n_dp  # num decoder points
         # Backbone feature projection
-        self.input_proj = nn.ModuleList(nn.Sequential(nn.Conv2d(x, hd, 1, bias=False), nn.BatchNorm2d(hd)) for x in ch)
+        self.input_proj = nn.ModuleList(nn.Sequential(nn.Conv2d(x, h_dims, 1, bias=False), nn.BatchNorm2d(h_dims)) for x in ch)
         # NOTE: simplified version but it's not consistent with .pt weights.
-        # self.input_proj = nn.ModuleList(Conv(x, hd, act=False) for x in ch)
+        # self.input_proj = nn.ModuleList(Conv(x, h_dims, act=False) for x in ch)
 
         # Transformer module
-        decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp)
-        self.decoder = DeformableTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        self.decoder_layer = DeformableTransformerDecoderLayer(h_dims, n_heads, d_ff, dropout, act, self.nl, n_dp)
+        self.decoder = DeformableTransformerDecoder(h_dims, self.decoder_layer, n_decoders, eval_idx)
 
         # Denoising part
-        self.denoising_class_embed = nn.Embedding(nc, hd)
-        self.num_denoising = nd
+        self.denoising_class_embed = nn.Embedding(nc, h_dims)
+        self.num_denoising = n_denoising
         self.label_noise_ratio = label_noise_ratio
         self.box_noise_scale = box_noise_scale
 
         # Decoder embedding
         self.learnt_init_query = learnt_init_query
         if learnt_init_query:
-            self.tgt_embed = nn.Embedding(nq, hd)
-        self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
+            self.tgt_embed = nn.Embedding(n_query, h_dims)
+        self.query_pos_head = MLP(4, 2 * h_dims, h_dims, num_layers=2)
 
         # Encoder head
-        self.enc_output = nn.Sequential(nn.Linear(hd, hd), nn.LayerNorm(hd))
-        self.enc_score_head = nn.Linear(hd, nc)
-        self.enc_bbox_head = MLP(hd, hd, 4, num_layers=3)
+        self.enc_output = nn.Sequential(nn.Linear(h_dims, h_dims), nn.LayerNorm(h_dims))
+        self.enc_score_head = nn.Linear(h_dims, nc)
+        self.enc_bbox_head = MLP(h_dims, h_dims, 4, num_layers=3)
 
         # Decoder head
-        self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
-        self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 4, num_layers=3) for _ in range(ndl)])
+        self.dec_score_head = nn.ModuleList([nn.Linear(h_dims, nc) for _ in range(n_decoders)])
+        self.dec_bbox_head = nn.ModuleList([MLP(h_dims, h_dims, 4, num_layers=3) for _ in range(n_decoders)])
 
         self._reset_parameters()
 
@@ -701,7 +703,7 @@ class RTDETRDecoder(nn.Module):
             self.query_pos_head,
             attn_mask=attn_mask,
         )
-        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
+        x = dec_bboxes, dec_scores, dn_meta
         if self.training:
             return x
         # (bs, 300, 4+nc)
@@ -838,6 +840,160 @@ class RTDETRDecoder(nn.Module):
         xavier_uniform_(self.query_pos_head.layers[1].weight)
         for layer in self.input_proj:
             xavier_uniform_(layer[0].weight)
+
+class DINOv2(RTDETRDecoder):
+    def __init__():
+        super().__init__()
+
+class DINOv2Pose(DINOv2):
+    def __init__(
+        self,
+        nc=80,
+        ch=(),
+        kpt_shape=(),
+        h_dims=256,  # hidden dim
+        n_heads=8,  # num head
+        n_decoders=6,  # num decoder layers
+        d_ff=1024,  # dim of feedforward
+        dropout=0.1,
+        act=nn.ReLU(),
+        eval_idx=-1,
+    ):
+        super().__init__(nc, ch, h_dims, n_heads, n_decoders, d_ff)
+
+        n_kpts = kpt_shape[0] * kpt_shape[1]
+        self.n_kpts = n_kpts
+        self.visibiliy = kpt_shape[1] > 2
+        self.enc_kpts_head = MLP(h_dims, h_dims, n_kpts, num_layers=3)
+        self.dec_kpts_head = nn.ModuleList([MLP(h_dims, h_dims, n_kpts, num_layers=3) for _ in range(n_decoders)])
+
+        self.decoder = DeformableTransformerPoseDecoder(h_dims,self.decoder_layer, n_decoders, eval_idx)
+        self._reset_pose_parameters()
+
+    def forward(self, x, batch=None):
+        """
+        Runs the forward pass of the module, returning bounding box and classification scores for the input.
+
+        Args:
+            x (List[torch.Tensor]): List of feature maps from the backbone.
+            batch (dict, optional): Batch information for training.
+
+        Returns:
+            (tuple | torch.Tensor): During training, returns a tuple of bounding boxes, scores, and other metadata.
+                During inference, returns a tensor of shape (bs, 300, 4+nc) containing bounding boxes and class scores.
+        """
+        from ultralytics.models.utils.ops import get_cdn_group_pose
+
+        # Input projection and embedding
+        feats, shapes = self._get_encoder_input(x)
+
+        # Prepare denoising training
+        dn_embed, dn_bbox, dn_kpts, attn_mask, dn_meta = get_cdn_group_pose(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+            self.visibiliy,
+        )
+
+        embed, refer_bbox, refer_kpts,  enc_bboxes, enc_kpts, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox, dn_kpts)
+
+        # Decoder
+        dec_bboxes, dec_kpts, dec_scores = self.decoder(
+            embed,
+            refer_bbox,
+            refer_kpts,
+            feats,
+            shapes,
+            self.dec_bbox_head,
+            self.dec_kpts_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attn_mask=attn_mask,
+        )
+
+        x = dec_bboxes, dec_kpts, dec_scores, dn_meta
+
+        if self.training:
+            return x
+        # (bs, 300, 4+nc)
+        y = torch.cat((dec_bboxes.squeeze(0), dec_kpts.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
+        
+        return y if self.export else (y, x)     
+
+
+    def _get_decoder_input(self, feats, shapes, dn_embed=None, dn_bbox=None, dn_kpts=None):
+        """
+        Generates and prepares the input required for the decoder from the provided features and shapes.
+
+        Args:
+            feats (torch.Tensor): Processed features from encoder.
+            shapes (list): List of feature map shapes.
+            dn_embed (torch.Tensor, optional): Denoising embeddings. Default is None.
+            dn_bbox (torch.Tensor, optional): Denoising bounding boxes. Default is None.
+            dn_kpts (torch.Tensor, optional): Denoising keypoints. Default is None.
+
+        Returns:
+            (tuple): Tuple containing embeddings, reference bounding boxes, encoded bounding boxes, and scores.
+        """
+        bs = feats.shape[0]
+        # Prepare input for decoder
+        anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+        features = self.enc_output(valid_mask * feats)  # bs, h*w, 256
+
+        enc_outputs_scores = self.enc_score_head(features)  # (bs, h*w, nc)
+
+        # Query selection
+        # (bs, num_queries)
+        topk_ind = torch.topk(enc_outputs_scores.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        # (bs, num_queries)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+
+        # (bs, num_queries, 256)
+        top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        # (bs, num_queries, 4)
+        top_k_anchors = anchors[:, topk_ind].view(bs, self.num_queries, -1)
+
+        # Dynamic anchors + static content
+        refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
+
+        # Simple regression for keypoints detection
+        refer_kpts = self.enc_kpts_head(top_k_features)
+
+        enc_bboxes = refer_bbox.sigmoid()
+        enc_kpts = refer_kpts.sigmoid().view(bs, self.num_queries, -1)
+
+        if dn_bbox is not None:
+            refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
+        if dn_kpts is not None:
+            refer_kpts = torch.cat([dn_kpts, refer_kpts], 1)
+
+        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+
+        embeddings = self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1) if self.learnt_init_query else top_k_features
+
+        if self.training:
+            refer_bbox = refer_bbox.detach()
+            refer_kpts = refer_kpts.detach()
+            if not self.learnt_init_query:
+                embeddings = embeddings.detach()
+
+        if dn_embed is not None:
+            embeddings = torch.cat([dn_embed, embeddings], 1)
+
+        return embeddings, refer_bbox, refer_kpts, enc_bboxes, enc_kpts, enc_scores 
+
+    def _reset_pose_parameters(self):
+        """Initializes or resets the parameters of the model's pose"""
+        constant_(self.enc_kpts_head.layers[-1].weight, 0.0)
+        for reg_ in self.dec_kpts_head:
+            constant_(reg_.layers[-1].weight, 0.0)
+            constant_(reg_.layers[-1].bias, 0.0)
+        
 
 
 class v10Detect(Detect):

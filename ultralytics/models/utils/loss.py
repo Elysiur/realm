@@ -453,3 +453,31 @@ class RTDETRDetectionLoss(DETRLoss):
             else:
                 dn_match_indices.append((torch.zeros([0], dtype=torch.long), torch.zeros([0], dtype=torch.long)))
         return dn_match_indices
+
+class DINOv2PoseLoss(DETRLoss):
+    def __init__(
+        self,
+        nc=80,
+        kpt_shape=(),
+        loss_gain=None,
+        aux_loss=True,
+        use_fl=True,
+        use_vfl=False,
+        use_uni_match=False,
+        uni_match_ind=0,
+        gamma=1.5,
+        alpha=0.25,
+    ):
+        super().__init__(
+            nc,
+            loss_gain,
+            aux_loss,
+            use_fl,
+            use_vfl,
+            use_uni_match,
+            uni_match_ind,
+            gamma,
+            alpha
+        )
+
+    def forward(self, pred_bboxes, pred_kpts, pred_scores, )

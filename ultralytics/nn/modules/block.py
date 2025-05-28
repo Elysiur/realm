@@ -4,11 +4,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
-from .transformer import TransformerBlock
+from .transformer import TransformerBlock, MLP
 
 __all__ = (
     "DFL",
@@ -499,7 +500,7 @@ class BottleneckCSP(nn.Module):
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
         self.act = nn.SiLU()
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(C3k(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
         """Apply CSP bottleneck with 3 convolutions."""
@@ -1846,14 +1847,16 @@ class A2C2f(nn.Module):
         """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
+        if(a2):
+            assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
 
+        n_head = min(8, c_ // 32)
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv((1 + n) * c_, c2, 1)
 
         self.gamma = nn.Parameter(0.01 * torch.ones(c2), requires_grad=True) if a2 and residual else None
         self.m = nn.ModuleList(
-            nn.Sequential(*(ABlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2)))
+            nn.Sequential(*(ABlock(c_, n_head, mlp_ratio, area) for _ in range(2)))
             if a2
             else C3k(c_, c_, 2, shortcut, g)
             for _ in range(n)
@@ -1964,3 +1967,269 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+class ShuffleBlockv2(nn.Module):
+    def __init__(self, c1, c2, s=1):
+        """_summary_
+            Args:
+                c1 (_type_): _description_
+                c2 (_type_): _description_
+                n (int, optional): _description_. Defaults to 1.
+                
+            Notice:
+                In most cases, make sure c1 == c2. else use "downsample=True" See:
+                ShuffleNet V2: Practical Guidelines for Efficient CNN Architecture Design
+                https://arxiv.org/abs/1807.11164
+        """
+
+        super().__init__()
+
+        self.conv = Conv(c1, c2, 1, 1, 0) if c1 != c2 else nn.Identity()
+
+        c_ = c2 // 2
+        
+        self.branch1 = nn.Sequential(
+            Conv(c_, c_, 1, 1, 0),
+            DWConv(c_, c_, 3, s),
+            Conv(c_, c_, 1, 1, 0)
+        )
+        
+        self.branch2 = nn.Sequential(
+            DWConv(c_, c_, 3, s),
+            Conv(c_, c_, 1, 1, 0)
+        ) \
+        if s > 1 else nn.Identity()
+
+    def _channel_shuffle(self, x, g=2):
+        B, C, H, W = x.shape
+
+        assert C % g == 0, "channel must be divided by groups"
+
+        c_ = C // g
+
+        x = x.view(B, g, c_, H, W)
+
+        x = torch.transpose(x, 1, 2).contiguous()
+
+        x = x.view(B, C, H, W)
+
+        return x
+
+    def forward(self, x):
+        x = self.conv(x)
+
+        y = torch.chunk(x, 2, dim=1)
+
+        x = torch.cat([self.branch1(y[0]), self.branch2(y[1])], dim=1)
+        
+        x = self._channel_shuffle(x,2)
+        
+        return x
+
+class HRCrossAttn(nn.Module):
+    def __init__(self, c1, c2, c3, d_model, n_heads, d_ff):
+        super().__init__()
+        assert c1 % n_heads == 0 & c2 % n_heads == 0, "input channels must be divisible by n_heads"
+        self.n_heads = n_heads
+        self.qk = Conv(c1, 2*d_model, 1, 1, 0, act=False)
+        self.v = Conv(c2, d_model, 1, 1, 0, act=False)
+        self.proj = Conv(d_model, c3, 1, 1, 0, act=False)
+        self.ffn = nn.Sequential(Conv(c3, d_ff, 1, 1, 0),Conv(d_ff, c3, 1, 1, 0, act=False))  
+
+    def forward(self, x, y):
+        """
+        Forward pass for cross attention in HRNet.
+
+        Args:
+            x (torch.Tensor): Input tensor from the first branch.
+            y (torch.Tensor): Input tensor from the second branch.
+
+        Returns:
+            torch.Tensor: Output tensor after applying cross attention.
+        """
+        # Assuming x and y are of shape [B, C, H, W]
+
+        B, C, H, W = x.shape
+
+        N = H * W
+
+        c_ = C // self.n_heads
+
+        q, k = self.qk(x).view(B, self.n_heads, c_, N).split([c_, c_], dim=2)
+
+        v = self.v(y).view(B, self.n_heads, -1, N)
+
+        attn = (q.transpose(-2, -1) @ k) * (self.n_heads **-0.5)
+        attn = attn.softmax(dim=-1)
+
+        x = v @ attn.transpose(-2, -1).view(B, C, H, W)
+
+        x = self.proj(x)
+
+        x = self.ffn(x)
+
+        return x
+
+class HREncoder(nn.Module):
+    def __init__(self, arg):
+        """
+        Initialize HRNet Encoder.
+
+        Args:
+            c1 (list): Input channels for each branch.
+            c2 (list): Output channels for each branch.
+            n (int): Number of stages.
+            nb (list): Number of blocks in each branch.
+        """
+        super().__init__()
+
+    def forward(self, x) -> list[torch.Tensor]:
+        return [x] # ensure x is a list to avoid dynamic compute graph
+
+
+class HRFuseBlock(nn.Module):
+    def __init__(self,c2, nb):
+        super().__init__()
+        self.num_branches = len(nb)
+        self.branches = self._make_branches(c2, nb)
+        self.fuse_layers = self._make_fuse_layers(c2)
+        self.relu = nn.ReLU(False)
+
+    def _make_branches(self, c2, nb):
+        return nn.ModuleList(
+            nn.Sequential(*[
+                ShuffleBlockv2(c2[idx],c2[idx]) 
+                for _ in range(nb[idx])
+            ])
+            for idx in range(self.num_branches)
+        )
+
+    def _make_fuse_layers(self, c2):
+        if self.num_branches == 1:
+            return nn.Identity()
+        
+        fuse_layers = nn.ModuleList()
+        for i in range(self.num_branches):
+            fuse_layer = nn.ModuleList()
+            for j in range(self.num_branches):
+                if j > i:
+                    fuse_layer.append(
+                        nn.Sequential(
+                            Conv(c2[j],c2[i],1,1,0),
+                            nn.Upsample(scale_factor=2**(j-i), mode='nearest')
+                        )
+                    )
+                elif j == i:
+                    fuse_layer.append(nn.Identity())
+                else: # j < i
+                    cvs = nn.Sequential()
+                    for k in range(i-j):
+                        if k == i - j - 1:
+                            cvs.append(ShuffleBlockv2(c2[j],c2[i],2))
+                        else:
+                            cvs.append(ShuffleBlockv2(c2[j],c2[j],2))
+                    fuse_layer.append(cvs)
+            # end fuse_layer
+
+            fuse_layers.append(fuse_layer)
+        #end fuse_layers
+
+        #overwrite fuse_layers[0][0]
+        fuse_layers[0][0] = nn.Identity()
+        
+        return nn.ModuleList(fuse_layers)
+
+    def forward(self, x) -> list[torch.Tensor]:
+        x = [self.branches[i](x[i]) for i in range(self.num_branches)]
+
+        fuse_layers = [
+            [self.fuse_layers[i][j](x[j]) for j in range(self.num_branches)]
+            for i in range(self.num_branches)
+        ]
+
+        fuse = []
+        for i in range(self.num_branches):
+            y = fuse_layers[i][0]
+            for j in range(1, self.num_branches):
+                y = y + fuse_layers[i][j]
+            fuse.append(y)
+
+        # have to write this way to avoid dynamic compute graph
+
+        fuse = [self.relu(fuse[i]) for i in range(self.num_branches)]
+
+        return fuse
+
+
+class HRBlock(nn.Module):
+    def __init__(self, c1, c2, n=1, nb=[]):
+        super().__init__()
+        c1 = [c1] if not isinstance(c1, list) else c1
+        self.num_branches = self._check_branches(c2, nb)
+        self.transition = self._make_transition_layer(c1, c2)
+        self.stage = self._make_stage(c2, n, nb)
+
+    def _check_branches(self, c2, nb):
+        assert len(c2) == len(nb) , "num of branches should follow the rules"
+
+        return len(nb)
+
+    def _make_transition_layer(self, c1, c2):
+        num_branches_c1 = len(c1)
+        num_branches_c2 = len(c2)
+
+        transition_layers = []
+        for i in range(num_branches_c2):
+            if i < num_branches_c1:
+                if c2[i] != c1[i]:
+                    transition_layers.append(ShuffleBlockv2(c1[i], c2[i],1))
+                else:
+                    transition_layers.append(nn.Identity())
+            else:
+                cvs = nn.Sequential()
+                for j in range(i+1-num_branches_c1):
+                    inchannels = c1[-1]
+                    outchannels = c2[i] if j == i-num_branches_c1 else inchannels
+                    cvs.append(ShuffleBlockv2(inchannels, outchannels,2))
+                transition_layers.append(cvs)
+
+        return nn.ModuleList(transition_layers)
+
+    def _make_stage(self, c2, n=1, nb=[]):
+        return nn.Sequential(*[HRFuseBlock(c2, nb) for _ in range(n)])
+    
+    def forward(self, x) -> list[torch.Tensor]:
+        y = [
+            self.transition[i](x[i])
+            if i < self.num_branches-1 else self.transition[i](x[-1])
+            for i in range(self.num_branches)
+        ]
+        
+        x = self.stage(y)
+
+        return x
+
+class HRDecoder(nn.Module):
+    def __init__(self, c1, hc=[]):
+        super().__init__()
+
+        self.num_branches = self._check_branches(c1, hc)
+
+        self.increment = nn.ModuleList(
+            nn.Sequential(
+                ShuffleBlockv2(c1[i], hc[i]),
+                ShuffleBlockv2(hc[i],hc[i])
+            )
+            for i in range(self.num_branches)
+        )
+
+    def _check_branches(self, c1, hc):
+        assert len(c1) == len(hc) , "num of branches should be the same"
+
+        return len(c1)
+    
+    def forward(self, x) -> torch.Tensor:
+        x = [self.increment[i](x[i]) for i in range(self.num_branches)]
+
+        return x
+

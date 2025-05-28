@@ -143,6 +143,7 @@ dmypy.json
 # datasets and projects (ignore /datasets dir at root only to allow for docs/en/datasets dir)
 /datasets
 runs/
+DDP/
 wandb/
 .DS_Store
 
@@ -174,6 +175,3 @@ pnnx*
 
 # calibration image
 calibration_*.npy
-
-# custom workspace
-workspace/

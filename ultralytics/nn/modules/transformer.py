@@ -473,7 +473,7 @@ class MSDeformAttn(nn.Module):
         xavier_uniform_(self.output_proj.weight.data)
         constant_(self.output_proj.bias.data, 0.0)
 
-    def forward(self, query, refer_bbox, value, value_shapes, value_mask=None):
+    def forward(self, query, reference, value, value_shapes, value_mask=None):
         """
         Perform forward pass for multiscale deformable attention.
 
@@ -481,7 +481,7 @@ class MSDeformAttn(nn.Module):
 
         Args:
             query (torch.Tensor): Tensor with shape [bs, query_length, C].
-            refer_bbox (torch.Tensor): Tensor with shape [bs, query_length, n_levels, 2], range in [0, 1],
+            reference (torch.Tensor): Tensor with shape [bs, query_length, n_levels, 2], range in [0, 1],
                 top-left (0,0), bottom-right (1, 1), including padding area.
             value (torch.Tensor): Tensor with shape [bs, value_length, C].
             value_shapes (list): List with shape [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})].
@@ -503,14 +503,14 @@ class MSDeformAttn(nn.Module):
         attention_weights = self.attention_weights(query).view(bs, len_q, self.n_heads, self.n_levels * self.n_points)
         attention_weights = F.softmax(attention_weights, -1).view(bs, len_q, self.n_heads, self.n_levels, self.n_points)
         # N, Len_q, n_heads, n_levels, n_points, 2
-        num_points = refer_bbox.shape[-1]
+        num_points = reference.shape[-1]
         if num_points == 2:
             offset_normalizer = torch.as_tensor(value_shapes, dtype=query.dtype, device=query.device).flip(-1)
             add = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
-            sampling_locations = refer_bbox[:, :, None, :, None, :] + add
+            sampling_locations = reference[:, :, None, :, None, :] + add
         elif num_points == 4:
-            add = sampling_offsets / self.n_points * refer_bbox[:, :, None, :, None, 2:] * 0.5
-            sampling_locations = refer_bbox[:, :, None, :, None, :2] + add
+            add = sampling_offsets / self.n_points * reference[:, :, None, :, None, 2:] * 0.5
+            sampling_locations = reference[:, :, None, :, None, :2] + add
         else:
             raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {num_points}.")
         output = multi_scale_deformable_attn_pytorch(value, value_shapes, sampling_locations, attention_weights)
@@ -539,14 +539,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         norm3 (nn.LayerNorm): Layer normalization after the feedforward network.
     """
 
-    def __init__(self, d_model=256, n_heads=8, d_ffn=1024, dropout=0.0, act=nn.ReLU(), n_levels=4, n_points=4):
+    def __init__(self, d_model=256, n_heads=8, d_ff=1024, dropout=0.1, act=nn.ReLU(), n_levels=4, n_points=4):
         """
         Initialize the DeformableTransformerDecoderLayer with the given parameters.
 
         Args:
             d_model (int): Model dimension.
             n_heads (int): Number of attention heads.
-            d_ffn (int): Dimension of the feedforward network.
+            d_ff (int): Dimension of the feedforward network.
             dropout (float): Dropout probability.
             act (nn.Module): Activation function.
             n_levels (int): Number of feature levels.
@@ -565,10 +565,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
         # FFN
-        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.linear1 = nn.Linear(d_model, d_ff)
         self.act = act
         self.dropout3 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.linear2 = nn.Linear(d_ff, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
@@ -577,7 +577,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         """Add positional embeddings to the input tensor, if provided."""
         return tensor if pos is None else tensor + pos
 
-    def forward_ffn(self, tgt):
+    def feed_forward(self, tgt):
         """
         Perform forward pass through the Feed-Forward Network part of the layer.
 
@@ -591,13 +591,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout4(tgt2)
         return self.norm3(tgt)
 
-    def forward(self, embed, refer_bbox, feats, shapes, padding_mask=None, attn_mask=None, query_pos=None):
+    def forward(self, embed, reference, feats, shapes, padding_mask=None, attn_mask=None, query_pos=None):
         """
         Perform the forward pass through the entire decoder layer.
 
         Args:
             embed (torch.Tensor): Input embeddings.
-            refer_bbox (torch.Tensor): Reference bounding boxes.
+            reference (torch.Tensor): tensor to be used as reference for attention.
             feats (torch.Tensor): Feature maps.
             shapes (list): Feature shapes.
             padding_mask (torch.Tensor, optional): Padding mask.
@@ -617,13 +617,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # Cross attention
         tgt = self.cross_attn(
-            self.with_pos_embed(embed, query_pos), refer_bbox.unsqueeze(2), feats, shapes, padding_mask
+            self.with_pos_embed(embed, query_pos), reference.unsqueeze(2).view(reference.shape[0],reference.shape[1],-1,2), feats, shapes, padding_mask
         )
         embed = embed + self.dropout2(tgt)
         embed = self.norm2(embed)
 
         # FFN
-        return self.forward_ffn(embed)
+        return self.feed_forward(embed)
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -711,3 +711,104 @@ class DeformableTransformerDecoder(nn.Module):
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)
+
+class DeformableTransformerPoseDecoder(DeformableTransformerDecoder):
+    """
+    Implementation of Deformable Transformer Decoder based on PaddleDetection.
+
+    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
+
+    Attributes:
+        layers (nn.ModuleList): List of decoder layers.
+        num_layers (int): Number of decoder layers.
+        hidden_dim (int): Hidden dimension.
+        eval_idx (int): Index of the layer to use during evaluation.
+    """
+
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+        """
+        Initialize the DeformableTransformerDecoder with the given parameters.
+
+        Args:
+            hidden_dim (int): Hidden dimension.
+            decoder_layer (nn.Module): Decoder layer module.
+            num_layers (int): Number of decoder layers.
+            eval_idx (int): Index of the layer to use during evaluation.
+        """
+        super().__init__(hidden_dim,decoder_layer,num_layers,eval_idx)
+        self.pose_layers = _get_clones(decoder_layer, num_layers)  # For pose decoder
+
+    def forward(
+        self,
+        embed,  # decoder embeddings
+        refer_bbox,  # anchor
+        refer_kpts,  # reference keypoints
+        feats,  # image features
+        shapes,  # feature shapes
+        bbox_head,
+        kpts_head,
+        score_head,
+        pos_mlp,
+        attn_mask=None,
+        padding_mask=None,
+    ):
+        """
+        Perform the forward pass through the entire decoder.
+
+        Args:
+            embed (torch.Tensor): Decoder embeddings.
+            refer_bbox (torch.Tensor): Reference bounding boxes.
+            feats (torch.Tensor): Image features.
+            shapes (list): Feature shapes.
+            bbox_head (nn.Module): Bounding box prediction head.
+            score_head (nn.Module): Score prediction head.
+            pos_mlp (nn.Module): Position MLP.
+            attn_mask (torch.Tensor, optional): Attention mask.
+            padding_mask (torch.Tensor, optional): Padding mask.
+
+        Returns:
+            dec_bboxes (torch.Tensor): Decoded bounding boxes.
+            dec_cls (torch.Tensor): Decoded classification scores.
+        """
+        output = embed
+        dec_bboxes = []
+        dec_kpts = []
+        dec_cls = []
+        last_refined_bbox = None
+        refer_bbox = refer_bbox.sigmoid()
+        refer_kpts = refer_kpts.sigmoid()
+        for i, layer in enumerate(self.layers):
+            output = layer(output, refer_bbox, feats, shapes, padding_mask, attn_mask, pos_mlp(refer_bbox))
+
+            bbox = bbox_head[i](output)
+            refined_bbox = torch.sigmoid(bbox + inverse_sigmoid(refer_bbox))
+
+            if self.training:
+                dec_cls.append(score_head[i](output))
+                if i == 0:
+                    dec_bboxes.append(refined_bbox)
+                else:
+                    dec_bboxes.append(torch.sigmoid(bbox + inverse_sigmoid(last_refined_bbox)))
+            elif i == self.eval_idx:
+                dec_cls.append(score_head[i](output))
+                dec_bboxes.append(refined_bbox)
+                break
+
+            last_refined_bbox = refined_bbox
+            refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+
+        for i, layer in enumerate(self.pose_layers):
+            output = layer(output, refer_kpts, feats, shapes, padding_mask, attn_mask, pos_mlp(refer_kpts))
+
+            kpts = kpts_head[i](output)
+            refined_kpts = torch.sigmoid(kpts + inverse_sigmoid(refer_kpts))
+
+            if self.training:
+                dec_kpts.append(refined_kpts)
+            elif i == self.eval_idx:
+                dec_kpts.append(refined_kpts)
+                break
+
+            refer_kpts = refined_kpts.detach() if self.training else refined_kpts
+
+        return torch.stack(dec_bboxes), torch.stack(dec_kpts), torch.stack(dec_cls)

@@ -68,7 +68,7 @@ if __name__ == "__main__":
 """
     (USER_CONFIG_DIR / "DDP").mkdir(exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        prefix="_temp_",
+        prefix=f"{trainer.args.name}_",
         suffix=f"{id(trainer)}.py",
         mode="w+",
         encoding="utf-8",
